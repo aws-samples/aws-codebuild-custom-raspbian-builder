@@ -1,0 +1,854 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Build custom Raspbian bare-metal install image from verified source.
+
+Parameters:
+  raspbianSourceUrl:
+    Type: String
+    Default: http://downloads.raspberrypi.org/raspbian_lite/images/raspbian_lite-2017-07-05/2017-07-05-raspbian-jessie-lite.zip
+    Description: |
+      Raspbian Lite URL -- 
+      From: https://www.raspberrypi.org/downloads/raspbian/ 
+      For faster builds, you can copy the source image to S3. 
+      Raspbian Jessie has been fully tested, Raspbian Stretch support is beta.
+      Jessie URL: http://downloads.raspberrypi.org/raspbian_lite/images/raspbian_lite-2017-07-05/2017-07-05-raspbian-jessie-lite.zip
+      Stretch URL: http://vx2-downloads.raspberrypi.org/raspbian_lite/images/raspbian_lite-2017-12-01/2017-11-29-raspbian-stretch-lite.zip
+
+  raspbianSourceSHA256:
+    Type: String
+    Default: f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531
+    Description: |
+      Raspbian Lite SHA-256 --  
+      Default from 2017-07-05 build --  
+      From: https://www.raspberrypi.org/downloads/raspbian/ -- 
+      Leave blank to skip hash verification (less secure). -- 
+      Jessie sha256 f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531 -- 
+      Stretch sha256 e942b70072f2e83c446b9de6f202eb8f9692c06e7d92c343361340cc016e0c9f
+      
+
+  installDocker:
+    Type: String
+    Default: "true"
+    AllowedValues: 
+      - true
+      - false
+    Description: "Docker install requires special steps compared to other packages.  Hence the built-in feature."
+
+  armArch:
+    Type: String
+    Default: "armv7"
+    AllowedValues: 
+      - armv7
+      - armv6
+    Description: "Customize build for target hardware - needed for Docker install as of 7/2017 - Pi 2 & Pi 3 use armv7.  Pi 1 & Pi Zero use armv6."
+
+  codeBuildImage:
+    Type: String
+    Default: aws/codebuild/docker:1.12.1
+    Description: |
+      Docker Codebuild Image.  
+      The stack has been tested with 1.12.1
+      For options, see http://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref.html
+
+  codeBuildComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_MEDIUM
+    AllowedValues: 
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+    Description: CodeBuild Compute Size.  Rasbian Source Build Requires a MEDIUM, but does not benefit from a LARGE.  See- http://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref.html#build-env-ref-compute-types
+
+  userName:
+    Type: String
+    Default: "iot-user"
+    Description: "Mandatory: Add a custom username as an alternative to the insecure & disabled default 'pi' username."
+
+  shadowHash:
+    Type: String
+    Default: "$6$SFMSKGrx$IqRKjl.lt21TX.hKyalVJMXSvVSoe1HEmeyxi48S2rglgWW3YSDycJcs0pKWYPIzf6eZDt2Oiobb9cwsJF/vn0"
+    Description: "Cleartext password is 'AWSlovesI0t!' Hash generated with mkpasswd (provided as part of the whois package on Raspbian)"
+    NoEcho: true
+
+  publicKey:
+    Type: String
+    Default: ""
+    Description: "Generate your own key pair: http://docs.aws.amazon.com/cloudhsm/latest/userguide/generate_ssh_key.html"
+    NoEcho: true
+
+  wifiNetwork:
+    Type: String
+    Default: ""
+    Description: "wifi SSID"
+
+  wifiPassword:
+    Type: String
+    Default: ""
+    Description: "Cleartext password.  More secure to provide a PSK below."
+    NoEcho: true
+
+  wifiPsk:
+    Type: String
+    Default: ""
+    Description: "Encrypted PSK.  See: https://www.raspberrypi.org/documentation/configuration/wireless/wireless-cli.md"
+    NoEcho: true
+
+  buildNotes:
+    Type: String
+    Default: "-"
+    Description: "Build notes added to s3 metadata for reference"
+
+  templateVersion:
+    Type: String
+    Default: 0
+    Description: "For debugging, increment this parameter to force CFN to re-run the template"
+    ## Uses a matching output to force the update
+
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Raspbian Source Info:"
+        Parameters: 
+          - raspbianSourceUrl
+          - raspbianSourceSHA256
+          - armArch
+      - 
+        Label: 
+          default: "Build Parameters:"
+        Parameters: 
+          - installDocker
+          - armArch
+      - 
+        Label: 
+          default: "Build Environment:"
+        Parameters: 
+          - codeBuildImage
+          - codeBuildComputeType
+      - 
+        Label: 
+          default: "Raspbian User Info:"
+        Parameters: 
+          - userName
+          - shadowHash
+          - publicKey
+      - 
+        Label: 
+          default: "Wifi Network Info:"
+        Parameters: 
+          - wifiNetwork
+          - wifiPassword
+          - wifiPsk
+
+Resources:
+  codebuildSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ "-", [ !Ref "AWS::StackName", !Ref "AWS::Region", !Ref "AWS::AccountId"] ]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+        - Id: Delete_Old_Versions
+          NoncurrentVersionExpirationInDays: 31
+          Status: Enabled
+
+  sourceToS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-source-to-s3
+      Handler: index.lambda_handler
+      Runtime: python2.7
+      Timeout: 5
+      Role: !GetAtt lambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import os
+          import zipfile
+          import httplib
+          import uuid
+          import urlparse
+          import json
+          
+          print('Loading function')
+          
+          from botocore.client import Config
+          s3 = boto3.client('s3')
+          codeBuild = boto3.client('codebuild')
+          
+          def send_response(request, response, status=None, reason=None):
+              """ Send our response to the pre-signed URL supplied by CloudFormation"""
+              if status is not None:
+                  response['Status'] = status
+              if reason is not None:
+                  response['Reason'] = reason
+              if 'ResponseURL' in request and request['ResponseURL']:
+                  url = urlparse.urlparse(request['ResponseURL'])
+                  body = json.dumps(response)
+                  https = httplib.HTTPSConnection(url.hostname)
+                  https.request('PUT', url.path+'?'+url.query, body)
+              return response
+          
+          def lambda_handler(event, context):
+              response = {
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Status': 'SUCCESS'
+              }
+              # PhysicalResourceId is meaningless here, but CloudFormation requires it
+              if 'PhysicalResourceId' in event:
+                  response['PhysicalResourceId'] = event['PhysicalResourceId']
+              else:
+                  response['PhysicalResourceId'] = str(uuid.uuid4())
+          
+              # There is nothing to do for a delete request
+              if event['RequestType'] == 'Delete':
+                  return send_response(event, response)
+
+              ## Get the S3 Bucket passed in from CFN
+              s3TargetBucket=event['ResourceProperties']['s3TargetBucket']
+              ## Get the file contents to put in S3 from CFN
+              dockerfile_body=event['ResourceProperties']['dockerfile_body']
+              buildspec_body=event['ResourceProperties']['buildspec_body']
+              build_image_body=event['ResourceProperties']['build_image_body']
+              dockerfile_armv6_body_include=event['ResourceProperties']['dockerfile_armv6_body_include']
+              dockerfile_armv7_body_include=event['ResourceProperties']['dockerfile_armv7_body_include']
+              first_run_setup_body=event['ResourceProperties']['first_run_setup_body']
+
+              ## Build the zip archive
+              zip_archive = zipfile.ZipFile('/tmp/build.zip', 'w')
+              zip_archive.writestr('buildspec.yml', buildspec_body)
+              zip_archive.writestr('Dockerfile', dockerfile_body)
+              zip_archive.writestr('dockerfile_armv6_include', dockerfile_armv6_body_include)
+              zip_archive.writestr('dockerfile_armv7_include', dockerfile_armv7_body_include)
+              zip_archive.writestr('build_new_image.sh', build_image_body)
+              zip_archive.writestr('first_run_setup.sh', first_run_setup_body)
+              zip_archive.close()
+              zip_file = open('/tmp/build.zip', 'r')
+          
+              ## Put the archive in S3
+              try:
+                  s3.put_object(
+                  Body= zip_file.read(),
+                  Bucket= s3TargetBucket,
+                  Key= "build.zip",
+                  )
+                  response['Data'] = {
+                      's3Success': 'true'
+                  }
+                  response['Reason'] = 'build.zip added to S3'
+
+              except Exception as E:
+                response['Reason'] = 'Event Failed - See CloudWatch logs for the Lamba function backing the custom resource for details'
+                ## Un-comment the line blow to send a true failure to CFN
+                ## will cause a stack rollback on failure and can leave the stack in a state that requires deletion.
+                #response['Status'] = 'FAILED'
+              # Log it!
+              print('Response Text: ' + str(response))
+              return send_response(event, response)
+
+  codeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref codeBuildServiceRole
+      TimeoutInMinutes: 45
+      Artifacts:
+        Type: S3
+        Location: !Sub arn:aws:s3:::${codebuildSourceBucket} 
+      Source:
+        Type: S3
+        Location: !Sub arn:aws:s3:::${codebuildSourceBucket}/build.zip
+      Environment:
+        ComputeType: !Ref codeBuildComputeType
+        Image: !Ref codeBuildImage
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: RASPBIAN_SOURCE_URL
+            Value: !Ref "raspbianSourceUrl"
+          - Name: RASPBIAN_SOURCE_SHA256
+            Value: !Ref "raspbianSourceSHA256"
+          - Name: CURRENT_REGION
+            Value: !Ref "AWS::Region"
+          - Name: PROJECT_S3_BUCKET
+            Value: !Ref "codebuildSourceBucket"
+          - Name: ARM_ARCH
+            Value: !Ref "armArch"
+          - Name: INSTALL_DOCKER
+            Value: !Ref "installDocker"
+          - Name: BUILD_NOTES
+            Value: !Ref "buildNotes"
+          - Name: USER_NAME
+            Value: !Ref "userName"
+          - Name: RSA_PUBLIC_KEY
+            Value: !Ref "publicKey"
+          - Name: USER_SHADOW_HASH
+            Value: !Ref "shadowHash"
+          - Name: WIFI_NETWORK
+            Value: !Ref "wifiNetwork"
+          - Name: WIFI_PASSWORD
+            Value: !Ref "wifiPassword"
+          - Name: WIFI_PSK
+            Value: !Ref "wifiPsk"
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+
+  triggerBuildPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt codePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref codebuildSourceBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GetSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              Configuration:
+                S3Bucket: !Ref codebuildSourceBucket
+                S3ObjectKey: build.zip
+              OutputArtifacts:
+                - Name: pipeline_artifact
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildToS3
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref codeBuildProject
+              InputArtifacts:
+                - Name: pipeline_artifact
+              RunOrder: 1
+
+  lambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Resource: arn:aws:logs:*:*:*
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          - Effect: Allow
+            Resource: !Sub arn:aws:s3:::${codebuildSourceBucket}/* 
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetObjectVersion
+
+  codeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codebuild
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codebuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action: 
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub arn:aws:s3:::${codebuildSourceBucket}/* 
+                Effect: Allow
+                Action: 
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+
+  codePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codepipeline
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "codepipeline.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: !GetAtt codeBuildProject.Arn
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+
+  ## Invoke the sourceToS3Lambda function and send the body text of files to put in S3
+  ## Lambda-backed custom resources provisioned inline in CFN via the Zipfile method have a 4096 byte limit.  
+  ## We pass the text in here to avoid exceeding that limit.
+  sourceToS3:
+    Type: Custom::sourceToS3Lambda
+    DependsOn: codebuildSourceBucket
+    Properties:
+      ServiceToken: !GetAtt sourceToS3Lambda.Arn
+      Region: !Ref "AWS::Region"
+      stackName: !Ref AWS::StackName
+      s3TargetBucket: !Ref codebuildSourceBucket
+      buildspec_body: |
+          #force function to run by changing this: 0
+          version: 0.2
+          ## Builds a custom Raspbian ARM image from verified Raspbian download source.
+          ## The full run takes roughly 20 minutes
+          
+          phases:
+            install:
+              commands:
+                ################################
+                # Set the variables
+                - RASPBIAN_DOWNLOAD_FILENAME="raspbian_download.zip"
+                ## Build an info file for the image
+                ## Stored with other build artifacts in /boot/buildinfo
+                - echo Built by AWS Codebuild > ./buildinfo.txt
+                - date >> ./buildinfo.txt
+                - echo Build Run ID $CODEBUILD_BUILD_ID >> ./buildinfo.txt
+                - echo RASPBIAN_SOURCE_URL $RASPBIAN_SOURCE_URL  >> ./buildinfo.txt
+                - echo RASPBIAN_SOURCE_SHA256 $RASPBIAN_SOURCE_SHA256  >> ./buildinfo.txt
+                - echo ARM_ARCH $ARM_ARCH  >> ./buildinfo.txt
+                - echo INSTALL_DOCKER $INSTALL_DOCKER  >> ./buildinfo.txt
+                - echo BUILD_NOTES $BUILD_NOTES  >> ./buildinfo.txt
+                - echo PROJECT_S3_BUCKET is $PROJECT_S3_BUCKET
+
+                ################################
+                # Install qemu & other utilities in the CodeBuild environment
+                - apt-get update
+                # whois package includes mkpasswd
+                - apt-get install -y qemu-system-arm qemu-user-static unzip curl apt-transport-https ca-certificates whois 
+                - apt-get install -y rsync parted dosfstools ed
+
+            pre_build:
+              commands:
+                ################################
+                # Download, unzip and SHA verify the download
+                - curl --location $RASPBIAN_SOURCE_URL -o $RASPBIAN_DOWNLOAD_FILENAME
+                - RASPBIAN_DOWNLOAD_SHA256=$(sha256sum raspbian_download.zip |awk '{printf $1}')
+                - echo RASPBIAN_DOWNLOAD_SHA256 is $RASPBIAN_DOWNLOAD_SHA256
+                # Compare SHA256 if RASPBIAN_SOURCE_SHA256 is not empty.
+                # Leaving the SHA256 field in CFN allows less secure, unverified download.
+                # Exit build if configured SHA256 does not match download
+                - if [ ! -z $RASPBIAN_SOURCE_SHA256 ] && [ "$RASPBIAN_DOWNLOAD_SHA256" != "$RASPBIAN_SOURCE_SHA256" ]; then echo "Build aborted.  SHA256 does not match"; exit 2; fi
+                # Find the image name within the zip & set to variable
+                - RASPBIAN_DOWNLOAD_IMGNAME=$(unzip -l $RASPBIAN_DOWNLOAD_FILENAME |egrep -m1 '^[0-9]+' |awk '{printf $4}')
+                - echo RASPBIAN_DOWNLOAD_IMGNAME is $RASPBIAN_DOWNLOAD_IMGNAME
+                - unzip raspbian_download.zip
+                ################################
+                # Calculate the disk offset of the ext4 root filesystem in the IMG for the mount command
+                - DISKOFFSET=`fdisk -l $RASPBIAN_DOWNLOAD_IMGNAME |/bin/egrep '\.img2' |awk '{print $2}'`
+                - DISKOFFSET=$((DISKOFFSET*512))
+                # Calculate the disk offset of the vfat /boot filesystem in the IMG for the mount command
+                - BOOT_DISKOFFSET=`fdisk -l $RASPBIAN_DOWNLOAD_IMGNAME |/bin/egrep '\.img1' |awk '{print $2}'`
+                - BOOT_DISKOFFSET=$((BOOT_DISKOFFSET*512))
+                - mkdir ./root_pimount
+
+                # Add some loopback interfaces so the mount succeeds
+                # Codebuild added loopback around 8/2017, this is no longer needed
+                # Docker needs to be running in privileged mode (default for CodeBuild) for this to succeed.
+                # - mknod /dev/loop0 -m0660 b 7 0
+                # - mknod /dev/loop1 -m0660 b 7 1
+
+                # Mount the partitions in the Raspbian install image
+                # Note that we mount the boot partition inside root so it presents as a single filesystem
+                # this matches the disk layout seen inside a running Raspberry Pi
+                - mount -v -o offset=$DISKOFFSET -t ext4 $RASPBIAN_DOWNLOAD_IMGNAME ./root_pimount/
+                - mount -v -o offset=$BOOT_DISKOFFSET -t vfat $RASPBIAN_DOWNLOAD_IMGNAME ./root_pimount/boot/
+                ################################
+                # Modify Dockerfile to include the arch-appropriate section to install Docker
+                - echo $ARM_ARCH
+                - if [ "$ARM_ARCH" = "armv6" ] && [ "$INSTALL_DOCKER" = true ]; 
+                  then (echo '/#<INSERT_DOCKER_INSTALL>/ -r dockerfile_armv6_include'; echo 'wq') | ed Dockerfile ;
+                  elif [ "$ARM_ARCH" = "armv7" ] && [ "$INSTALL_DOCKER" = true ] ;
+                  then (echo '/#<INSERT_DOCKER_INSTALL>/ -r dockerfile_armv7_include'; echo 'wq') | ed Dockerfile ;
+                  fi 
+
+            build:
+              commands:
+                ################################
+                - echo Build started on `date`
+                - echo Building...     
+
+                ## Pre Docker-run root filesystem modifications 
+                ## Enable Serial Console for Dev/Debug systems
+                ## borderline security risk since physical access allows other attack surfaces (sd card)
+                - echo 'enable_uart=1' >> ./root_pimount/boot/config.txt
+                # Ensure that raspi-config does not run under Docker build
+                - chmod a-x ./root_pimount/usr/bin/raspi-config       
+
+                # Raspbian container networking (and other things?) fail if you leave this file intact
+                # during a Docker run. back-up, then empty the file
+                - cp ./root_pimount/etc/ld.so.preload ./ld.so.preload.bak
+                - echo > ./root_pimount/etc/ld.so.preload
+
+                # Add qemu emulation into the mounted image
+                - cp /usr/bin/qemu-arm-static ./root_pimount/usr/bin/qemu-arm-static
+
+                ## Docker-run
+                # Build the full Raspbian Docker image
+                - tar -C  ./root_pimount/ -c .  | docker import - docker-raspbian
+                # Unmount the image filesystems, we no longer need them.
+                - umount ./root_pimount/boot
+                - umount ./root_pimount
+
+                # Execute changes via the Dockerfile
+                - docker build ./ -t docker-raspbian:source
+                # Run the image then export the resulting container to a tar file
+                - docker run --name docker-raspbian-container docker-raspbian:source echo hello-world
+                - docker export --output="raspbian-from-docker.tar" docker-raspbian-container  
+
+                # Unpack the tar build into a local directory
+                - mkdir ./root_pibuild
+                - tar -C root_pibuild -xf raspbian-from-docker.tar
+
+                ## Post Docker-run root & boot filesystem modifications
+                ## Build the startup-script system
+                ## This allows system customization my adding shell scripts on to the FAT /boot partition
+                ## /boot mounts when you insert the Raspberry SD card into a Mac or PC.
+                ## Mounting the ext4 root filesystem is much more involved
+                - mkdir ./root_pibuild/boot/startup-scripts
+                - mkdir ./root_pibuild/boot/startup-scripts/run-once
+                - mkdir ./root_pibuild/boot/startup-scripts/run-once/resources
+                - mkdir ./root_pibuild/boot/startup-scripts/every-time
+                - mkdir ./root_pibuild/boot/startup-scripts/every-time/resources
+                - mkdir ./root_pibuild/boot/startup-scripts/ran-once
+                - mkdir ./root_pibuild/boot/startup-scripts/ran-once/resources
+                ## Set /boot/startup-scripts/* to run on startup
+                - sed -i 's|^exit 0||g' ./root_pibuild/etc/rc.local
+                - echo "find /boot/startup-scripts/every-time/ -maxdepth 1 -exec /bin/bash {} ';' -print" >> ./root_pibuild/etc/rc.local
+                - echo "find /boot/startup-scripts/run-once/ -maxdepth 1 -exec /bin/bash {} ';' -print" >> ./root_pibuild/etc/rc.local
+                - echo "find /boot/startup-scripts/run-once/ -maxdepth 1 ! -type d -exec /bin/mv {} /boot/startup-scripts/ran-once/ ';' -print" >> ./root_pibuild/etc/rc.local
+                - echo "find /boot/startup-scripts/run-once/resources/ -maxdepth 1 ! -type d -exec /bin/mv {} /boot/startup-scripts/ran-once/resources/ ';' -print" >> ./root_pibuild/etc/rc.local
+                - echo "find /boot/startup-scripts/run-once/*  -exec /bin/mv {} /boot/startup-scripts/ran-once/ ';' -print" >> ./root_pibuild/etc/rc.local
+                - echo "exit 0" >> /etc/rc.local
+
+                ## Add the rsa public key for first_run_setup.sh to copy on first boot.
+                - echo $RSA_PUBLIC_KEY > ./root_pibuild/boot/startup-scripts/run-once/resources/iot_rsa.pub
+
+                ## Inject user variables into first_run_setup.sh
+                - echo "## Build Variables injected by CodeBuild" > ./first_run_setup.tmp
+                - echo "MYBUILD_USER_NAME='"$USER_NAME"'" >> ./first_run_setup.tmp
+                - echo "MYBUILD_USER_SHADOW_HASH='"$USER_SHADOW_HASH"'" >> ./first_run_setup.tmp
+                - echo "MYBUILD_WIFI_NETWORK='"$WIFI_NETWORK"'" >> ./first_run_setup.tmp
+                - echo "MYBUILD_WIFI_PASSWORD='"$WIFI_PASSWORD"'" >> ./first_run_setup.tmp
+                - echo "MYBUILD_WIFI_PSK='"$WIFI_PSK"'" >> ./first_run_setup.tmp
+                - (echo '/CodeBuildInsertVariables/ -r first_run_setup.tmp'; echo 'wq') | ed first_run_setup.sh ;
+                - cat first_run_setup.sh > ./root_pibuild/boot/startup-scripts/run-once/first_run_setup.sh
+
+                # Re-inject previously emptied file before final build
+                - cat ./ld.so.preload.bak > ./root_pibuild/etc/ld.so.preload 
+                # Re-enable raspi-config for first boot on device
+                - chmod a+x ./root_pibuild/usr/bin/raspi-config
+                # Copy build info into /boot/buildinfo
+                - mkdir ./root_pibuild/boot/buildinfo
+                - cp ./buildspec.yml ./root_pibuild/boot/buildinfo
+                - cp ./Dockerfile ./root_pibuild/boot/buildinfo
+                - cp ./buildinfo.txt ./root_pibuild/boot/buildinfo
+                - touch ./root_pibuild/boot/`date +%m-%d_%H-%M`-buildtime
+                
+                # Build the new image
+                # Formatting is very sensitive in build_new_image.sh
+                # so cleaner to run this as a separate script
+                # Creates an image sized for the files built into root_pibuild
+                # allowing for both smaller downloads and installations of arbitrary size
+                #
+                # Mounts the boot and root filesystems into root_pimount
+                # Adds partition UUID into appropriate files so system boots/mounts properly
+                - bash ./build_new_image.sh $RASPBIAN_DOWNLOAD_IMGNAME
+                # Copy build to new mounted image
+                - rsync -aHAXx --exclude var/cache/apt/archives root_pibuild/ root_pimount/
+                # Unmount image
+                - umount ./root_pimount/boot
+                - umount ./root_pimount
+                # Add date and arch to image name
+                - RASPBIAN_UPLOAD_IMGNAME=$STACK_NAME-`date +%m%d-%H%M`-$ARM_ARCH-$RASPBIAN_DOWNLOAD_IMGNAME 
+                - mv $RASPBIAN_DOWNLOAD_IMGNAME $RASPBIAN_UPLOAD_IMGNAME
+                # Zip the image for upload
+                - zip custom-raspbian-lite.zip $RASPBIAN_UPLOAD_IMGNAME
+
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo copying the image to s3...
+                - S3_METADATA="buildId=$CODEBUILD_BUILD_ID,buildNotes=$BUILD_NOTES,armArch=$ARM_ARCH,downloadUrl=$RASPBIAN_SOURCE_URL,sourceSHA256=$RASPBIAN_SOURCE_SHA256,installDocker=$INSTALL_DOCKER"
+                - aws s3 cp custom-raspbian-lite.zip s3://$PROJECT_S3_BUCKET/$STACK_NAME-`date +%m%d-%H%M`-$ARM_ARCH-$RASPBIAN_DOWNLOAD_IMGNAME.zip --region $CURRENT_REGION --metadata $S3_METADATA
+                
+      dockerfile_body: |
+          #force function to run by changing this: 0
+          FROM docker-raspbian
+
+          ## Full Raspbian update
+          RUN apt-get -y update
+          RUN apt-get -y upgrade
+          RUN apt-get -y dist-upgrade
+
+          ## Install other packages
+          RUN apt-get -y install vim 
+          RUN apt-get -y install python-pip python-pysocks git
+
+
+          ##################################################
+          ## Install Docker
+          ##################################################
+          ## The AUTO_REPLACE_DOCKER_INSTALL section below is populated by CodeBuild
+          ## with the appropriate dockerfile_armvX_include
+          ##################################################
+          #<INSERT_DOCKER_INSTALL>
+          ##################################################
+          ## End Docker Install Section
+          ##################################################
+
+          ## Optional: Install Python packages for IoT & Docker SDK
+          # RUN pip install --upgrade pip
+          # RUN pip install paho-mqtt
+          # RUN pip install docker
+          # RUN pip install AWSIoTPythonSDK
+ 
+          ##################################################
+          ## These directives are duplicated in first_run_setup.sh
+          ## We left them here as an example
+          ## Uncomment to bake these settings into the image.
+          ## Enable sshd
+          #RUN systemctl enable ssh
+          ## Disable default pi user (insecure due to published default password)
+          #RUN usermod -L '' pi
+          ##################################################
+
+      dockerfile_armv6_body_include: |
+          ## Pi 1 & Zero - arm6/armel arch
+          ## Deprecated, but apparently the only way for now. (July 2017)
+          ## See https://github.com/docker/docker-ce-packaging/pull/11
+          ## Debian wants to run Docker after install which causes an error and will stop the build
+          ## The: '&& echo "..." || echo "..."' construct returns an exit 0 to CodeBuild regardless of the error
+          RUN curl -sSL https://get.docker.com | sh && echo "Docker Installed" || echo "Docker Installed but errored on run. (as designed)"
+
+      dockerfile_armv7_body_include: |
+          ## Pi 2 & 3 - arm7/arm8/armhf
+          ## https://docs.docker.com/engine/installation/linux/debian/#install-using-the-repository
+          RUN apt-get -y install apt-transport-https ca-certificates curl gnupg2 software-properties-common libapparmor1 libltdl7
+          RUN curl -fsSL https://download.docker.com/linux/debian/gpg | sudo apt-key add -
+          RUN echo "deb [arch=armhf] https://download.docker.com/linux/debian \
+              $(lsb_release -cs) stable" | \
+              sudo tee /etc/apt/sources.list.d/docker.list
+          RUN apt-get -y update
+          ## Debian wants to run Docker after install which causes an error and will stop the build
+          ## The: '&& echo "..." || echo "..."' construct returns an exit 0 to CodeBuild regardless of the error
+          RUN apt-get -y install docker-ce && echo "Docker Installed" || echo "Docker Installed but errored on run. (as designed)"
+
+      first_run_setup_body: |
+          #!/bin/bash
+          ## This script is copied to /boot/run-once for initial setup
+          ## If you need network access for any commands, either move the commands into the Codebuild process 
+          ## or ensure that network.internet access is up before the command runs
+          ## Builds script: /boot/startup-scripts/run-once/first_run_setup.sh
+          ## After first run, script is moved to /boot/startup-scripts/ran-once/first_run_setup.sh
+          ## You can mount the /boot partition on Mac/Win system, and move (and modify) the script to the run-once directory
+          ## for troubleshooting without having to re-run the build
+          #
+          ##CodeBuildInsertVariables (do not modify this line, used as an insert marker by CodeBuild)
+
+          ## lock the default pi user
+          usermod -L pi
+          ## can unlock with this command
+          #usermod -U pi
+
+          ## Enable sshd (set once to run on all subsequent restarts)
+          systemctl enable ssh && systemctl start ssh
+          ## To disable ssh
+          # systemctl disable ssh && systemctl stop ssh
+
+          ## Set Hostname
+          # We use the last 10 digits of the Pi hardware serial number here
+          MY_HOSTNAME=`cat /proc/cpuinfo |egrep Serial| awk '{print $3}'|cut -c 7-`
+          hostnamectl set-hostname $MY_HOSTNAME
+
+          ## Modify motd
+          echo >> /etc/motd
+          cat /boot/buildinfo/buildinfo.txt >> /etc/motd
+          echo >> /etc/motd
+          dmesg |egrep -o 'Raspberry\ Pi.*' >> /etc/motd
+          cat /proc/cpuinfo |egrep Serial >> /etc/motd
+          echo >> /etc/motd
+
+          ## Add your own user and credentials
+          useradd -m $MYBUILD_USER_NAME --shell /bin/bash
+          mkdir /home/$MYBUILD_USER_NAME/.ssh
+          cat /boot/startup-scripts/run-once/resources/iot_rsa.pub >> /home/$MYBUILD_USER_NAME/.ssh/authorized_keys
+          chmod -R 700 /home/$MYBUILD_USER_NAME/.ssh
+          chown -R $MYBUILD_USER_NAME: /home/$MYBUILD_USER_NAME/.ssh
+
+          ## Comment out to use ssh keys only
+          ## If ssh keys only, change the corresponding sudo permissions in the following block
+          sed -i "s|$MYBUILD_USER_NAME:\!|$MYBUILD_USER_NAME:$MYBUILD_USER_SHADOW_HASH|g" "/etc/shadow"
+
+          ## Uncomment one and only one of the sudoers setup commands below.
+          ## Give user sudo permissions, but DO NOT require a password for escalation
+          #echo "$MYBUILD_USER_NAME ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$MYBUILD_USER_NAME
+          ## Give user sudo permissions, but DO require a password for escalation
+          echo "$MYBUILD_USER_NAME ALL=(ALL) ALL" > /etc/sudoers.d/$MYBUILD_USER_NAME
+
+          ## Setup WiFi
+          if [ -z "$MYBUILD_WIFI_NETWORK" ]; then BUILD_WIFI_CONFIG=false; fi
+          if  [[ -z "$MYBUILD_WIFI_PASSWORD" && -z "$MYBUILD_WIFI_PSK" ]]; then BUILD_WIFI_CONFIG=false; fi
+          if  $BUILD_WIFI_CONFIG ; then
+            if [ -z "$MYBUILD_WIFI_PSK" ] ; then
+              MYBUILD_DERIVED_WIFI_PSK="\"$MYBUILD_WIFI_PASSWORD\""
+              else
+              MYBUILD_DERIVED_WIFI_PSK=$MYBUILD_WIFI_PSK
+            fi
+          fi
+          if $BUILD_WIFI_CONFIG ; then
+            echo "network={
+                ssid=\"$MYBUILD_WIFI_NETWORK\"
+                psk=$MYBUILD_DERIVED_WIFI_PSK
+                }" >> /etc/wpa_supplicant/wpa_supplicant.conf
+            wpa_cli reconfigure
+          fi
+
+          ##################################################
+          ## Sample /etc/wpa_supplicant/wpa_supplicant.conf
+          ## If you want to overwrite the entire file include the top 3 lines
+          ## documented below, in addition to your custom config.
+          #
+          # country=GB
+          # ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+          # update_config=1
+          # network={ 
+          #     ssid="" 
+          #     # wrap cleartext psk in "" quotes.  Omit quotes for encrypted psk 
+          #     # generated by wpa_passphrase
+          #     psk=
+          #     }
+          ##################################################
+
+
+      build_image_body: |
+          ## Deployed on CodeBuild as build_new_image.sh, called by buildspec.yml
+          ## Code derived from pi-gen project (the code that builds official Raspbian images for public distribution) 
+          ## RPi-Distro/pi-gen is licensed under the BSD 3-clause "New" or "Revised" License
+          ## https://github.com/RPi-Distro/pi-gen/blob/dev/LICENSE
+          #!/bin/bash -e
+          RASPBIAN_DOWNLOAD_IMGNAME=$1
+          rm -f $RASPBIAN_DOWNLOAD_IMGNAME
+          EXPORT_ROOTFS_DIR=root_pibuild
+          ROOTFS_DIR=root_pimount
+          BOOT_SIZE=$(du --apparent-size -s ${EXPORT_ROOTFS_DIR}/boot --block-size=1 | cut -f 1)
+          TOTAL_SIZE=$(du --apparent-size -s ${EXPORT_ROOTFS_DIR} --exclude var/cache/apt/archives --block-size=1 | cut -f 1)
+          IMG_SIZE=$((BOOT_SIZE + TOTAL_SIZE + (800 * 1024 * 1024)))
+          truncate -s ${IMG_SIZE} ${RASPBIAN_DOWNLOAD_IMGNAME}
+
+          ######################################
+          ## Leave empty lines in the following code block, or build will break.
+          fdisk -H 255 -S 63 ${RASPBIAN_DOWNLOAD_IMGNAME} <<EOF
+          o
+          n
+          
+          
+          8192
+          +$((BOOT_SIZE * 2 /512))
+          p
+          t
+          c
+          n
+          
+          
+          8192
+          
+          
+          p
+          w
+          EOF
+          ######################################
+
+          PARTED_OUT=$(parted -s ${RASPBIAN_DOWNLOAD_IMGNAME} unit b print)
+          BOOT_OFFSET=$(echo "$PARTED_OUT" | grep -e '^ 1'| xargs echo -n \
+          | cut -d" " -f 2 | tr -d B)
+          BOOT_LENGTH=$(echo "$PARTED_OUT" | grep -e '^ 1'| xargs echo -n \
+          | cut -d" " -f 4 | tr -d B)
+          
+          ROOT_OFFSET=$(echo "$PARTED_OUT" | grep -e '^ 2'| xargs echo -n \
+          | cut -d" " -f 2 | tr -d B)
+          ROOT_LENGTH=$(echo "$PARTED_OUT" | grep -e '^ 2'| xargs echo -n \
+          | cut -d" " -f 4 | tr -d B)
+
+          BOOT_DEV=$(losetup --show -f -o ${BOOT_OFFSET} --sizelimit ${BOOT_LENGTH} ${RASPBIAN_DOWNLOAD_IMGNAME})
+          ROOT_DEV=$(losetup --show -f -o ${ROOT_OFFSET} --sizelimit ${ROOT_LENGTH} ${RASPBIAN_DOWNLOAD_IMGNAME})
+          echo "/boot: offset $BOOT_OFFSET, length $BOOT_LENGTH"
+          echo "/:     offset $ROOT_OFFSET, length $ROOT_LENGTH"
+          mkdosfs -n boot -F 32 -v $BOOT_DEV > /dev/null
+          mkfs.ext4 -O ^huge_file $ROOT_DEV > /dev/null
+          mount -v $ROOT_DEV ${ROOTFS_DIR} -t ext4
+          mkdir -p ${ROOTFS_DIR}/boot
+          mount -v $BOOT_DEV ${ROOTFS_DIR}/boot -t vfat
+
+          # Find the new PARTUUID
+          IMGID="$(fdisk -l ${RASPBIAN_DOWNLOAD_IMGNAME} | sed -n 's/Disk identifier: 0x\([^ ]*\)/\1/p')"
+          # Replace the PARTUUID from the download image source with the new image PARTUUID
+          sed -i "s/PARTUUID=\([^-]*\)/PARTUUID=${IMGID}/p" ./root_pibuild/etc/fstab 
+          sed -i "s/PARTUUID=\([^-]*\)/PARTUUID=${IMGID}/" ./root_pibuild/boot/cmdline.txt 
+
+Outputs:
+  codebuildSourceBucket:
+     Value: 
+      !Ref codebuildSourceBucket
+  buildNotes:
+     Value: 
+      !Ref buildNotes
+  templateVersion:
+     Value: 
+      !Ref templateVersion
+
