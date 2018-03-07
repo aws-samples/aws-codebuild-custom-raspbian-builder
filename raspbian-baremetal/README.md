@@ -10,7 +10,7 @@ Provisioned as a single CloudFormation template.
 To deploy the solution, create the CloudFormation Stack, fill out inputs, wait 10-20 minutes and a custom SD card image is produced into an S3 bucket.  
 
 
-![Architecture Diagram](./images/architecture_diagram.png)
+![Architecture Diagram](/images/baremetal_architecture.png)
 
 
 __Tested on:__ 
@@ -25,6 +25,7 @@ Because of this, the Stack name must be compatible with the name restrictions of
 * Download the image, burn to SD, and boot your Raspberry!  
 *We have had great success using Resin.io's [Etcher](https://etcher.io) to burn the image to SD cards.*  
 * For per-device cusomization, see the *Startup script mechanism* section below.  
+* For faster build-times, download and copy the Raspbian OS source into a public S3 bucket in the same region.
 
 __Resources deployed by Cloudformation:__
 * S3 Bucket for source code and Raspbian image output.

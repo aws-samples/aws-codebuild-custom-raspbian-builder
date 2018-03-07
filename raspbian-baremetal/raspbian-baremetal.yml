@@ -17,14 +17,12 @@ Parameters:
     Type: String
     Default: f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531
     Description: |
-      Raspbian Lite SHA-256 --  
-      Default from 2017-07-05 build --  
-      From: https://www.raspberrypi.org/downloads/raspbian/ -- 
       Leave blank to skip hash verification (less secure). -- 
-      Jessie sha256 f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531 -- 
-      Stretch sha256 e942b70072f2e83c446b9de6f202eb8f9692c06e7d92c343361340cc016e0c9f
+      Raspbian Lite SHA-256 --  
+      From: https://www.raspberrypi.org/downloads/raspbian/ -- 
+      Jessie 2017-07-05 sha256 f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531 -- 
+      Stretch 2017-12-01 sha256 e942b70072f2e83c446b9de6f202eb8f9692c06e7d92c343361340cc016e0c9f
       
-
   installDocker:
     Type: String
     Default: "true"
@@ -66,7 +64,7 @@ Parameters:
   shadowHash:
     Type: String
     Default: "$6$SFMSKGrx$IqRKjl.lt21TX.hKyalVJMXSvVSoe1HEmeyxi48S2rglgWW3YSDycJcs0pKWYPIzf6eZDt2Oiobb9cwsJF/vn0"
-    Description: "Cleartext password is 'AWSlovesI0t!' Hash generated with mkpasswd (provided as part of the whois package on Raspbian)"
+    Description: "For security, change to your own password/shadow hash.  Default cleartext password is 'AWSlovesI0t!' Hash generated with mkpasswd (provided as part of the whois package on Raspbian)"
     NoEcho: true
 
   publicKey:
@@ -95,7 +93,7 @@ Parameters:
   buildNotes:
     Type: String
     Default: "-"
-    Description: "Build notes added to s3 metadata for reference"
+    Description: "Build notes added to s3 metadata and build for reference"
 
   templateVersion:
     Type: String
