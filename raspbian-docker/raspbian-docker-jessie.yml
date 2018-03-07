@@ -1,0 +1,602 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Build Raspbian Docker Image from verified source.
+
+Parameters:
+  codeBuildImage:
+    Type: String
+    Default: aws/codebuild/docker:1.12.1
+    Description: |
+      Docker Codebuild Image.  
+      The stack has been tested with 1.12.1
+      For options, see http://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref.html
+
+  raspbianSourceUrl:
+    Type: String
+    Default: http://downloads.raspberrypi.org/raspbian_lite/images/raspbian_lite-2017-07-05/2017-07-05-raspbian-jessie-lite.zip
+    Description: |
+      Raspbian Lite URL -- 
+      From: https://www.raspberrypi.org/downloads/raspbian/ 
+
+  raspbianSourceSHA256:
+    Type: String
+    Default: f143cb29140209a7a9fccc5395c9e2d924a0ca82976a4ec9b31b7d1478856531
+    Description: |
+      Raspbian Lite SHA-256 --  
+      Default from 2017-07-05 build --  
+      From: https://www.raspberrypi.org/downloads/raspbian/ -- 
+      Leave blank to skip hash verification (less secure).
+
+  codeBuildComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_MEDIUM
+    AllowedValues: 
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+    Description: CodeBuild Compute Size.  See- http://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref.html#build-env-ref-compute-types
+    ## Rasbian Source Build Requires a MEDIUM, but does not benefit from a LARGE
+  
+  imageReductionMethod:
+    Type: String
+    Default: export-import
+    Description: |
+      export-import - Default, most secure as it does not break chain-of-custody from source to container.  --  
+                      Uses native docker-export to docker-import to reduce image size.  --  
+                      May lose Dockerfile network and volume configurations which are not used in this project.  --  
+      docker-squash - Uses third party code from pip install docker-squash.  --  
+                      Breaks secure chain-of-custody.  --  
+                      Differs from native docker --squash as it can squash the large base layer.  --  
+    AllowedValues: 
+      - export-import
+      - docker-squash
+    ConstraintDescription: We only allow 'export-import' & 'docker-squash'
+  
+  templateVersion:
+    Type: String
+    Default: 0
+    Description: "For debugging, increment this parameter to force CFN to re-run the template"
+    ## Uses a matching output to force the update
+
+Resources:
+  codebuildSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ "-", [ !Ref "AWS::StackName", !Ref "AWS::Region", !Ref "AWS::AccountId"] ]
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+        - Id: Delete_Old_Versions
+          NoncurrentVersionExpirationInDays: 31
+          Status: Enabled
+
+  ecrDestinationRepository:
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: !Ref AWS::StackName
+
+  sourceToS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-source-to-s3
+      Handler: index.lambda_handler
+      Runtime: python2.7
+      Timeout: 5
+      Role: !GetAtt lambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import boto3
+          import os
+          import zipfile
+          import httplib
+          import uuid
+          import urlparse
+          import json
+          
+          print('Loading function')
+          
+          from botocore.client import Config
+          s3 = boto3.client('s3')
+          codeBuild = boto3.client('codebuild')
+          
+          def send_response(request, response, status=None, reason=None):
+              """ Send our response to the pre-signed URL supplied by CloudFormation"""
+              if status is not None:
+                  response['Status'] = status
+              if reason is not None:
+                  response['Reason'] = reason
+              if 'ResponseURL' in request and request['ResponseURL']:
+                  url = urlparse.urlparse(request['ResponseURL'])
+                  body = json.dumps(response)
+                  https = httplib.HTTPSConnection(url.hostname)
+                  https.request('PUT', url.path+'?'+url.query, body)
+              return response
+          
+          def lambda_handler(event, context):
+              response = {
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Status': 'SUCCESS'
+              }
+              # PhysicalResourceId is meaningless here, but CloudFormation requires it
+              if 'PhysicalResourceId' in event:
+                  response['PhysicalResourceId'] = event['PhysicalResourceId']
+              else:
+                  response['PhysicalResourceId'] = str(uuid.uuid4())
+          
+              # There is nothing to do for a delete request
+              if event['RequestType'] == 'Delete':
+                  return send_response(event, response)
+
+              ## Get the S3 Bucket passed in from CFN
+              s3TargetBucket=event['ResourceProperties']['s3TargetBucket']
+              ## Get the file contents to put in S3 from CFN
+              dockerfile_body=event['ResourceProperties']['dockerfile_body']
+              buildspec_body=event['ResourceProperties']['buildspec_body']
+              aptitude_cleanup_body=event['ResourceProperties']['aptitude_cleanup_body']
+              package_removal_list_body=event['ResourceProperties']['package_removal_list_body']
+
+              ## Build the zip archive
+              zip_archive = zipfile.ZipFile('/tmp/build.zip', 'w')
+              zip_archive.writestr('buildspec.yml', buildspec_body)
+              zip_archive.writestr('Dockerfile', dockerfile_body)
+              zip_archive.writestr('aptitude_cleanup.sh', aptitude_cleanup_body)
+              zip_archive.writestr('package_removal_list.txt', package_removal_list_body)
+              zip_archive.close()
+              zip_file = open('/tmp/build.zip', 'r')
+          
+              ## Put the archive in S3
+              try:
+                  s3.put_object(
+                  Body= zip_file.read(),
+                  Bucket= s3TargetBucket,
+                  Key= "build.zip",
+                  )
+                  response['Data'] = {
+                      's3Success': 'true'
+                  }
+                  response['Reason'] = 'build.zip added to S3'
+
+              except Exception as E:
+                response['Reason'] = 'Event Failed - See CloudWatch logs for the Lamba function backing the custom resource for details'
+                ## Un-comment the line blow to send a true failure to CFN
+                ## will cause a stack rollback on failure and can leave the stack in a state that requires deletion.
+                #response['Status'] = 'FAILED'
+              # Log it!
+              print('Response Text: ' + str(response))
+              return send_response(event, response)
+## END LAMBDA
+
+  codeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref AWS::StackName
+      ServiceRole: !Ref codeBuildServiceRole
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: S3
+        Location: !Sub arn:aws:s3:::${codebuildSourceBucket} 
+      Source:
+        Type: S3
+        Location: !Sub arn:aws:s3:::${codebuildSourceBucket}/build.zip
+      Environment:
+        ComputeType: !Ref codeBuildComputeType
+        Image: !Ref codeBuildImage
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: DEST_REPOSITORY
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrDestinationRepository}:latest
+          - Name: RASPBIAN_SOURCE_URL
+            Value: !Ref raspbianSourceUrl
+          - Name: RASPBIAN_SOURCE_SHA256
+            Value: !Ref "raspbianSourceSHA256"
+          - Name: CURRENT_REGION
+            Value: !Ref "AWS::Region"
+          - Name: IMAGE_REDUCTION_METHOD
+            Value: !Ref imageReductionMethod
+
+  triggerBuildPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref AWS::StackName
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt codePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref codebuildSourceBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GetSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: S3
+              Configuration:
+                S3Bucket: !Ref codebuildSourceBucket
+                S3ObjectKey: build.zip
+              OutputArtifacts:
+                - Name: !Ref AWS::StackName
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildToEcr
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref codeBuildProject
+              InputArtifacts:
+                - Name: !Ref AWS::StackName
+              RunOrder: 1
+
+## IAM Resources
+  lambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Resource: arn:aws:logs:*:*:*
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          - Effect: Allow
+            Resource: arn:aws:s3:::*
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetObjectVersion
+
+  codeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codebuild
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codebuild
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action: 
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+              - Resource: arn:aws:s3:::*
+                Effect: Allow
+                Action: 
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !GetAtt ecrDestinationRepository.Arn
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+
+  codePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-codepipeline
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "codepipeline.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codepipeline
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - iam:PassRole
+
+  ## Invoke the sourceToS3Lambda function and send the body text of files to put in S3
+  ## Lambda-backed custom resources provisioned inline in CFN 
+  ## via the Zipfile method have a 4096 byte limit.  
+  ## We pass the text in here to avoid exceeding that limit.
+  sourceToS3:
+    Type: Custom::sourceToS3Lambda
+    Properties:
+      ServiceToken: !GetAtt sourceToS3Lambda.Arn
+      Region: !Ref "AWS::Region"
+      stackName: !Ref AWS::StackName
+      s3TargetBucket: !Ref codebuildSourceBucket
+      dockerfile_body: |
+          #force function to run by changing this: 0
+          FROM docker-raspbian
+          RUN apt-get update
+          #RUN apt-get upgrade -y
+          ## Uninstall all the unnecessary things for a containerized Raspbian
+          COPY ./aptitude_cleanup.sh /aptitude_cleanup.sh
+          RUN chmod a+rwx /aptitude_cleanup.sh
+          COPY package_removal_list.txt /package_removal_list.txt
+          RUN chmod a+r /package_removal_list.txt
+          RUN /aptitude_cleanup.sh
+          #RUN for packageRemove in $(echo $desiredRemove); do dpkg --list $packageRemove ; if [ $? -eq 0 ]; then doRemove="$doRemove $packageRemove"; else echo $packageRemove; fi; done; aptitude remove -y $doRemove
+          ## Failed Step 4 : RUN for packageRemove in $(echo $desiredRemove); do dpkg --list $packageRemove ; if [ $? -eq 0 ]; then doRemove="$doRemove $packageRemove"; fi; done; echo $doRemove; aptitude remove -y $doRemove
+          ## Worked Step 4 : RUN for packageRemove in $(echo $desiredRemove); do dpkg --list $packageRemove ; if [ $? -eq 0 ]; then doRemove="$doRemove $packageRemove"; else echo $packageRemove; fi; done; aptitude remove -y $doRemove
+          ## Clean out all the apt-stuff to reduce the image size
+          RUN apt-get -y purge $(dpkg -l | grep ^rc | awk '{print $2}') 
+          RUN apt-get autoclean 
+          RUN apt-get clean
+          RUN rm -rf /var/cache/apt 
+          RUN rm -rf /var/lib/dpkg/info/* 
+          RUN rm -rf /var/lib/apt/lists/* 
+          RUN rm -f /aptitude_cleanup.sh
+          COPY ./buildinfo-base /buildinfo-base
+      ## End Dockerfile Body
+
+      buildspec_body: |
+          version: 0.2
+          #force function to run by changing this: 0
+          ## Builds a Raspbian ARM container from verified Raspbian download source.
+          ## The full run takes roughly 15 minutes
+          ## Builds and reduces the image to ~ 116MB / 46MB compressed
+
+          ## Security Note:
+          ## The script optionally uses docker-squash from pip
+          ## This is unverified 3rd party code.
+          
+          phases:
+            install:
+              commands:
+                ################################
+                # Set the variables
+                - RASPBIAN_DOWNLOAD_FILENAME="raspbian_download.zip"
+                ## Build a buildinfo file for the container
+                - echo Built by AWS CodeBuild > ./buildinfo-base
+                - date >> ./buildinfo-base
+                - echo Build Run ID $CODEBUILD_BUILD_ID >> ./buildinfo-base
+                - echo IMAGE_REDUCTION_METHOD $IMAGE_REDUCTION_METHOD >> ./buildinfo-base
+                - echo RASPBIAN_SOURCE_URL $RASPBIAN_SOURCE_URL  >> ./buildinfo-base
+                - echo RASPBIAN_SOURCE_SHA256 $RASPBIAN_SOURCE_SHA256  >> ./buildinfo-base
+                ################################
+                # Install qemu & other utilities
+                - apt-get update
+                - apt-get install -y qemu-system-arm qemu-user-static unzip curl apt-transport-https ca-certificates python-pip
+                # Install docker-squash if needed
+                - if [ "$IMAGE_REDUCTION_METHOD" = "docker-squash" ] ; 
+                  then pip install docker-squash ; 
+                  fi
+            pre_build:
+              commands:
+                ################################
+                # Download, unzip and SHA verify the download
+                - curl --location $RASPBIAN_SOURCE_URL -o $RASPBIAN_DOWNLOAD_FILENAME
+                - RASPBIAN_DOWNLOAD_SHA256=$(sha256sum raspbian_download.zip |awk '{printf $1}')
+                - echo RASPBIAN_DOWNLOAD_SHA256 is $RASPBIAN_DOWNLOAD_SHA256
+                # Compare SHA256 if RASPBIAN_SOURCE_SHA256 is not empty.
+                # Leaving the SHA256 field in CFN allows less secure, unverified download.
+                # Exit build if configured SHA256 does not match download
+                - if [ ! -z $RASPBIAN_SOURCE_SHA256 ] && [ "$RASPBIAN_DOWNLOAD_SHA256" != "$RASPBIAN_SOURCE_SHA256" ]; then echo "Build aborted.  SHA256 does not match"; exit 2; fi
+                # This could break if Raspbian changes their download zip to include more than a single file
+                - RASPBIAN_DOWNLOAD_IMGNAME=$(unzip -l $RASPBIAN_DOWNLOAD_FILENAME |egrep -m1 '^[0-9]+' |awk '{printf $4}')
+                - echo RASPBIAN_DOWNLOAD_IMGNAME is $RASPBIAN_DOWNLOAD_IMGNAME
+                - unzip raspbian_download.zip
+                ################################
+                # Calculate the disk offset of the ext4 filesystem in the IMG for the mount command
+                - DISKOFFSET=`fdisk -l $RASPBIAN_DOWNLOAD_IMGNAME |/bin/egrep '\.img2' |awk '{print $2}'`
+                - DISKOFFSET=$((DISKOFFSET*512))
+                - mkdir ./pimount
+                # Add some loopback interfaces so the mount succeeds
+                # Codebuild added loopback around 8/2017, this is no longer needed
+                # Docker needs to be running in privileged mode (default for CodeBuild) for this to succeed.
+                # - mknod /dev/loop0 -m0660 b 7 0
+                # - mknod /dev/loop1 -m0660 b 7 1
+                # Mount the ext4 filesystem
+                - mount -v -o offset=$DISKOFFSET -t ext4 $RASPBIAN_DOWNLOAD_IMGNAME ./pimount/
+                ################################
+                # Log in to ECR
+                - echo Logging in to Amazon ECR...
+                - echo destination repository is $DEST_REPOSITORY in $CURRENT_REGION
+                ## We have to use the CURRENT_REGION variable passed in from CFN
+                ## because the Codebuild AWS_DEFAULT_REGION environment variable
+                ## does not work in sub-shells
+                - $(aws ecr get-login --region $CURRENT_REGION)
+          
+            build:
+              commands:
+                ################################
+                - echo Build started on `date`
+                - echo Building the Docker image...          
+                # Add qemu into the mounted image
+                - cp /usr/bin/qemu-arm-static ./pimount/usr/bin/qemu-arm-static
+                # Raspbian container networking (and other things?) fail if you leave this file intact
+                - echo > ./pimount/etc/ld.so.preload
+                # Build the full Raspbian Docker image
+                - tar -C  ./pimount/ -c . --exclude=/proc --exclude=/sys --exclude=/opt/vc | docker import - docker-raspbian
+                # Build and clean the image via the Dockerfile
+                - docker build ./ -t docker-raspbian:source
+                # docker-squash method fails if you don't explicitly set the encoding
+                - export LANG=C.UTF-8
+                ## Reduce the image
+                - if [ "$IMAGE_REDUCTION_METHOD" = "docker-squash" ] ; 
+                  then docker-squash -c docker-raspbian:source -t docker-raspbian:reduced ; 
+                  elif [ "$IMAGE_REDUCTION_METHOD" = "export-import" ] ;
+                  then docker run --name docker-raspbian-container docker-raspbian:source echo hi ;
+                  docker export docker-raspbian-container  |  docker import - docker-raspbian:reduced ;
+                  fi
+                # Tag for push to ECR
+                - docker tag docker-raspbian:reduced $DEST_REPOSITORY
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $DEST_REPOSITORY
+        ## End of buildspec.yml body
+      aptitude_cleanup_body: |
+        #!/bin/bash
+        desiredRemove=`cat /package_removal_list.txt`
+        #for packageRemove in $(echo $desiredRemove); do
+        for packageRemove in $(echo $desiredRemove); do
+          $(dpkg --list $packageRemove &> /dev/null)
+          if [[ $? -eq 0 ]]; then
+            doRemove="$doRemove $packageRemove"
+            echo "Remove:" $packageRemove
+          else echo "Not Installed:" $packageRemove
+          fi
+        done
+        echo "Running aptitude:"
+        echo "Remove list:" $doRemove
+        aptitude remove -y $doRemove 
+        #apt-get remove -y --allow-remove-essential $doRemove  
+      ## End of aptitude_cleanup_body  
+      package_removal_list_body: |
+        alsa-utils apt-listchanges apt-transport-https apt-utils aptitude aptitude-common 
+        aufs-tools avahi-daemon bash-completion bind9-host binutils bluez bluez-firmware 
+        bsdmainutils build-essential bzip2 ca-certificates cifs-utils console-setup 
+        console-setup-linux cpio cpp cpp-4.9 crda cron curl dbus dc debconf-utils 
+        debian-archive-keyring device-tree-compiler dh-python dhcpcd5 dmidecode 
+        dosfstools dphys-swapfile dpkg-dev ed fake-hwclock fakeroot fbset file 
+        firmware-atheros firmware-brcm80211 firmware-libertas firmware-ralink 
+        firmware-realtek fontconfig fontconfig-config fonts-dejavu-core g++ g++-4.9 
+        gcc gcc-4.6-base:armhf gcc-4.7-base:armhf gcc-4.9 gdb gdbserver geoip-database 
+        gettext-base gir1.2-glib-2.0:armhf git git-man gnupg-agent gnupg2 groff-base 
+        hardlink hicolor-icon-theme ifupdown inetutils-ping info init-system-helpers 
+        initramfs-tools install-info iptables iputils-ping isc-dhcp-client isc-dhcp-common 
+        iso-codes iw kbd keyboard-configuration klibc-utils kmod less libalgorithm-c3-perl 
+        libalgorithm-diff-perl libalgorithm-diff-xs-perl libalgorithm-merge-perl 
+        libapparmor1:armhf libapt-inst1.5:armhf libarchive-extract-perl libasan1:armhf 
+        libasound2-data libasound2:armhf libasprintf0c2:armhf libassuan0:armhf 
+        libatk1.0-0:armhf libatk1.0-data libatomic1:armhf libavahi-client3:armhf 
+        libavahi-common-data:armhf libavahi-common3:armhf libavahi-core7:armhf 
+        libbind9-90 libboost-iostreams1.49.0 libboost-iostreams1.50.0 libboost-iostreams1.53.0 
+        libboost-iostreams1.54.0:armhf libboost-iostreams1.55.0:armhf libbsd0:armhf 
+        libc-dev-bin libc6-dbg:armhf libc6-dev:armhf libcairo2:armhf libcap-ng0:armhf 
+        libcgi-fast-perl libcgi-pm-perl libclass-c3-perl libclass-c3-xs-perl libcloog-isl4:armhf 
+        libcpan-meta-perl libcups2:armhf libcurl3-gnutls:armhf libcurl3:armhf 
+        libcwidget3:armhf libdaemon0:armhf libdata-optlist-perl libdata-section-perl 
+        libdatrie1:armhf libdbus-1-3:armhf libdbus-glib-1-2:armhf libdns-export100 
+        libdns100 libdpkg-perl libdrm2:armhf libedit2:armhf liberror-perl libestr0 
+        libevent-2.0-5:armhf libexpat1:armhf libfakeroot:armhf libfcgi-perl libffi6:armhf 
+        libfile-fcntllock-perl libfontconfig1:armhf libfreetype6-dev libfreetype6:armhf 
+        libgcc-4.9-dev:armhf libgdbm3:armhf libgdk-pixbuf2.0-0:armhf libgdk-pixbuf2.0-common 
+        libgeoip1:armhf libgirepository-1.0-1:armhf libglib2.0-0:armhf libglib2.0-data 
+        libgmp10:armhf libgnutls-deb0-28:armhf libgnutls-openssl27:armhf libgomp1:armhf 
+        libgpm2:armhf libgraphite2-3:armhf libgssapi-krb5-2:armhf libgtk2.0-0:armhf 
+        libgtk2.0-bin libgtk2.0-common libharfbuzz0b:armhf libhogweed2:armhf libicu52:armhf 
+        libident libidn11:armhf libirs-export91 libisc-export95 libisc95 libisccc90 
+        libisccfg-export90 libisccfg90 libisl10:armhf libiw30:armhf libjasper1:armhf 
+        libjbig0:armhf libjim0.75:armhf libjpeg62-turbo:armhf libjson-c2:armhf 
+        libk5crypto3:armhf libkeyutils1:armhf libklibc libkrb5-3:armhf libkrb5support0:armhf 
+        libksba8:armhf libldap-2.4-2:armhf liblog-message-perl liblog-message-simple-perl 
+        liblogging-stdlog0:armhf liblognorm1:armhf libltdl7:armhf libluajit-5.1-common 
+        liblwres90 libmagic1:armhf libmodule-build-perl libmodule-pluggable-perl 
+        libmodule-signature-perl libmpc3:armhf libmpdec2:armhf libmpfr4:armhf 
+        libmro-compat-perl libnettle4:armhf libnewt0.52:armhf libnfnetlink0:armhf 
+        libnfsidmap2:armhf libnih-dbus1 libnih1 libnl-3-200:armhf libnl-genl-3-200:armhf 
+        libnss-mdns:armhf libopts25:armhf libp11-kit0:armhf libpackage-constants-perl 
+        libpam-chksshpwd:armhf libpango-1.0-0:armhf libpangocairo-1.0-0:armhf 
+        libpangoft2-1.0-0:armhf libparams-util-perl libparted2:armhf libpcsclite1:armhf 
+        libpipeline1:armhf libpixman-1-0:armhf libplymouth4:armhf libpng12-0:armhf 
+        libpng12-dev:armhf libpod-latex-perl libpod-readme-perl libpopt0:armhf 
+        libpsl0:armhf libpth20:armhf libpython-stdlib:armhf libpython2.7-minimal:armhf 
+        libpython2.7-stdlib:armhf libpython2.7:armhf libpython3-stdlib:armhf libpython3.4-minimal:armhf 
+        libpython3.4-stdlib:armhf libraspberrypi-bin libraspberrypi-dev libraspberrypi-doc 
+        libraspberrypi0 libregexp-common-perl librtmp1:armhf libsamplerate0:armhf 
+        libsasl2-2:armhf libsasl2-modules-db:armhf libsasl2-modules:armhf libsigc++-1.2-5c2 
+        libsigc++-2.0-0c2a:armhf libsoftware-license-perl libsqlite3-0:armhf libssh2-1:armhf 
+        libssl1.0.0:armhf libstdc++-4.9-dev:armhf libsub-exporter-perl libsub-install-perl 
+        libsysfs2:armhf libtalloc2:armhf libtasn1-6:armhf libterm-ui-perl libtext-soundex-perl 
+        libtext-template-perl libthai-data libthai0:armhf libtiff5:armhf libtimedate-perl 
+        libtirpc1:armhf libubsan0:armhf libudev0:armhf libusb-1.0-0:armhf libv4l-0:armhf 
+        libv4l2rds0:armhf libv4lconvert0:armhf libwbclient0:armhf libwrap0:armhf 
+        libx11-6:armhf libx11-data libxapian22 libxau6:armhf libxcb-render0:armhf 
+        libxcb-shm0:armhf libxcb1:armhf libxcomposite1:armhf libxcursor1:armhf 
+        libxdamage1:armhf libxdmcp6:armhf libxext6:armhf libxfixes3:armhf libxi6:armhf 
+        libxinerama1:armhf libxml2:armhf libxmuu1:armhf libxrandr2:armhf libxrender1:armhf 
+        libxtables10 linux-libc-dev:armhf locales logrotate lsb-release lua5.1 
+        luajit make makedev man-db manpages manpages-dev mime-support module-init-tools 
+        mountall nano ncdu ncurses-term net-tools netcat-openbsd netcat-traditional 
+        nfs-common ntp openresolv openssh-client openssh-server openssh-sftp-server 
+        openssl parted patch perl perl-modules pi-bluetooth pinentry-gtk2 pkg-config 
+        plymouth psmisc python python-apt python-apt-common python-chardet python-colorama 
+        python-distlib python-html5lib python-minimal python-ndg-httpsclient python-openssl 
+        python-pip python-pkg-resources python-pyasn1 python-pysocks python-requests 
+        python-rpi.gpio python-setuptools python-six python-support python-urllib3 
+        python-wheel python2.7 python2.7-minimal python3 python3-apt python3-dbus 
+        python3-gi python3-minimal python3-software-properties python3.4 python3.4-minimal 
+        raspberrypi-bootloader raspberrypi-kernel raspberrypi-net-mods raspberrypi-sys-mods 
+        raspbian-archive-keyring raspi-config raspi-copies-and-fills rename rpcbind 
+        rpi-update rsync rsyslog samba-common sgml-base shared-mime-info software-properties-common 
+        ssh strace tasksel tasksel-data tcpd traceroute triggerhappy ucf 
+        unattended-upgrades unzip usb-modeswitch usb-modeswitch-data usbutils 
+        v4l-utils vim vim-common vim-runtime vim-tiny wget whiptail wireless-regdb 
+        wireless-tools wpasupplicant xauth xdg-user-dirs xkb-data xml-core xz-utils
+
+Outputs:
+  ecrDestinationRepositoryName: 
+    Value:
+      !Ref ecrDestinationRepository
+    Export:
+      Name: !Sub ${AWS::StackName}-ecr-name
+  ecrDestinationRepositoryArn: 
+    Value:
+      !GetAtt ecrDestinationRepository.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ecr-arn
+  ecrDestinationRepositoryUri: 
+    Value:
+      !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ecrDestinationRepository}
+    Export:
+      Name: !Sub ${AWS::StackName}-ecr-url
+  codebuildSourceBucket:
+     Value: 
+      !Ref codebuildSourceBucket
+  templateVersion:
+     Value: 
+      !Ref templateVersion
+
