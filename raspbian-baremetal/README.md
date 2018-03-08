@@ -1,14 +1,11 @@
 # Raspbian Custom Baremetal
-AWS project to build a custom Raspbian image from verified Source.  
+AWS project to build a custom Raspbian image from verified source.  
 
-Outputs custom OS images for a Raspberry Pi to Amazon S3, ready to download, burn to SD card and deploy.  
-Stock customizations provided as Cloudformation parameters include wifi settings, user credentials and an option to install Docker.  
-Further customizations are supported by modifying AWS CodeBuild's buildspec.yml and Dockerfile inline in the AWS CloudFormation template.  
-Per device customizations are supported by the Startup script mechanism documented below.  
-
-Provisioned as a single CloudFormation template.  
-To deploy the solution, create the CloudFormation Stack, fill out inputs, wait 10-20 minutes and a custom SD card image is produced into an S3 bucket.  
-
+* Outputs custom OS images for a Raspberry Pi to Amazon S3, ready to download, burn to SD card and deploy.  
+* Stock customizations provided as Cloudformation parameters include wifi settings, user credentials and an option to install Docker.  
+* Further customizations are supported by modifying AWS CodeBuild's buildspec.yml and Dockerfile inline in the AWS CloudFormation template.  
+* Per device customizations are supported by the Startup script mechanism documented below.  
+* Provisioned as a single CloudFormation template.  
 
 ![Architecture Diagram](/images/baremetal_architecture.png)
 
@@ -46,7 +43,7 @@ __CodeBuild process details:__
 * [Qemu](https://www.qemu.org) emulation is installed in the CodeBuild environment to allow us to run an ARM binary container on CodeBuild's underlying x86 ec2 instance.  
 * Full Raspbian install image is downloaded and SHA256 verified.  
 * root & boot partitions from the Raspbian image are mounted into the CodeBuild environment.  
-* Make modifications in the mounted filesystems if desired.
+* Directly modify files in the mounted filesystems.
 * Tar the mounted filesystems and import into Docker as a Docker Image.  
 * Run a docker build with the Dockerfile, using the Docker Image built in the previous step as the source.  
 * Because we have a running copy of the ARM/Raspbian OS, Docker can execute commands (apt-get etc) to modify the operating system.
