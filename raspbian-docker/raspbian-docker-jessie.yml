@@ -376,7 +376,7 @@ Resources:
           RUN rm -rf /var/lib/dpkg/info/* 
           RUN rm -rf /var/lib/apt/lists/* 
           RUN rm -f /aptitude_cleanup.sh
-          COPY ./buildinfo-base /buildinfo-base
+          COPY ./buildinfo-base /buildinfo.txt
       ## End Dockerfile Body
 
       buildspec_body: |
