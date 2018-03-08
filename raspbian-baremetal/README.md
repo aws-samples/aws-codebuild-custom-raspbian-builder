@@ -21,14 +21,17 @@ Because of this, the Stack name must be compatible with the name restrictions of
 * The resulting image can be found in the S3 Bucket shown in the Stack Output: codebuildSourceBucket.  
 * Download the image, burn to SD, and boot your Raspberry!  
 *We have had great success using Resin.io's [Etcher](https://etcher.io) to burn the image to SD cards.*  
+* Direct modifications can be made to the OS filesystem when mounted in CodeBuild.  
+* Modifications requiring running binaries in Raspbian (apt-get etc.) can be made via the Dockerfile.  
 * For per-device cusomization, see the *Startup script mechanism* section below.  
-* For faster build-times, download and copy the Raspbian OS source into a public S3 bucket in the same region.
+* For faster build-times, download and copy the Raspbian OS source into a public S3 bucket in the same region.  
+Then use the s3 url as the *raspbianSourceUrl* input to CloudFormation.
 
 __Resources deployed by Cloudformation:__
 * S3 Bucket for source code and Raspbian image output.
 * CodePipeline
 * CodeBuild Project
-* Lambda Function to inject source code for CodePipeline
+* Lambda Function to zip and copy source code for CodePipeline
 * IAM roles and permissions
 
 __Steps in build process:__

@@ -21,11 +21,11 @@ __Instructions:__
 Because of this, the Stack name must be compatible with the name restrictions of all services deployed by the stack.  (a-z 0-9 _ -)  
 * CloudFormation will run a CodePipeline/CodeBuild job that outputs the Raspbian image to Amazon Elastic Container Registry in 10-20 minutes.  
 * The resulting image can be found in the ECR repository shown in the Stack Output: *ecrDestinationRepositoryName*.  
-* Download the image with Docker by first [authenticating with ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/Registries.html#registry_auth) then [pulling the image.](https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-pull-ecr-image.html).     
+* Download the image with Docker by first [authenticating with ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/Registries.html#registry_auth) then [pulling the image](https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-pull-ecr-image.html).     
 * For faster build-times, download and copy the Raspbian OS source into a public S3 bucket in the same region.  
-Then use the s3 url as the *raspbianSourceUrl* input to CloudFormation.
-* The build system uses aptitude to remove packages not needed in a Docker image.  
-You can modify the script to leave or install desired packages in the build.  
+Then use the s3 url as the *raspbianSourceUrl* input to CloudFormation.  
+* Direct modifications can be made to the OS filesystem when mounted in CodeBuild.  
+* Modifications requiring running binaries in Raspbian (apt-get etc.) can be made via the Dockerfile.    
 * The resulting image is ~50MB compressed ~115MB uncompressed, matching Debian's official image size.  
 
 __Resources deployed by Cloudformation:__
@@ -33,7 +33,7 @@ __Resources deployed by Cloudformation:__
 * ECR Repository for Raspbian image output
 * CodePipeline
 * CodeBuild Project
-* Lambda Function to inject source code for CodePipeline
+* Lambda Function to zip and copy source code for CodePipeline
 * IAM roles and permissions
 
 __Steps in build process:__
