@@ -2,7 +2,7 @@
 AWS project to build a custom Raspbian image from verified source.  
 
 * Outputs custom OS images for a Raspberry Pi to Amazon S3, ready to download, burn to SD card and deploy.  
-* Stock customizations provided as Cloudformation parameters include wifi settings, user credentials and an option to install Docker.  
+* Stock customizations provided as CloudFormation parameters include wifi settings, user credentials and an option to install Docker.  
 * Further customizations are supported by modifying AWS CodeBuild's buildspec.yml and Dockerfile inline in the AWS CloudFormation template.  
 * Per device customizations are supported by the Startup script mechanism documented below.  
 * Provisioned as a single CloudFormation template.  
