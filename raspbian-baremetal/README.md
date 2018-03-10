@@ -46,7 +46,7 @@ __CodeBuild process details:__
 * [Qemu](https://www.qemu.org) emulation is installed in the CodeBuild environment to allow us to run an ARM binary container on CodeBuild's underlying x86 ec2 instance.  
 * Full Raspbian install image is downloaded and SHA256 verified.  
 * root & boot partitions from the Raspbian image are mounted into the CodeBuild environment.  
-* Directly modify files in the mounted filesystems.
+* Directly modify the mounted filesystems.
 * Tar the mounted filesystems and import into Docker as a Docker Image.  
 * Run a docker build with the Dockerfile, using the Docker Image built in the previous step as the source.  
 * Because we have a running copy of the ARM/Raspbian OS, Docker can execute commands (apt-get etc) to modify the operating system.
