@@ -21,6 +21,7 @@ Because of this, the Stack name must be compatible with the name restrictions of
 * The resulting image can be found in the S3 Bucket shown in the Stack Output: codebuildSourceBucket.  
 * Download the image, burn to SD, and boot your Raspberry!  
 *We have had great success using Resin.io's [Etcher](https://etcher.io) to burn the image to SD cards.*  
+*Note that you may need to boot the Raspberry, give it 5 minutes to run the initial setup, then re-boot to connect to wifi.* 
 * Direct modifications can be made to the OS filesystem when mounted in CodeBuild.  
 * Modifications requiring running binaries in Raspbian (apt-get etc.) can be made via the Dockerfile.  
 * For per-device cusomization, see the *Startup script mechanism* section below.  
