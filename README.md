@@ -25,7 +25,7 @@ This project builds images from SHA256-verified Raspbian source, so you are assu
 **Note that official ARM binary images are now available for Debian and Ubuntu.*  
 * Enables customization at build time via the included Dockerfile.  
 * Installs [Qemu](https://www.qemu.org) in the image, enabling it to run on x86 hosts for test and dev.     
-
+ 
 ## License
 
 This library is licensed under the Apache 2.0 License. 
